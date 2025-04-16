@@ -10,12 +10,9 @@ import dbus.mainloop.glib
 from gi.repository import GObject, GLib
 import threading
 
-gi.require_version("Gtk", "3.0")
-try:
-    gi.require_version("WebKit2", "4.1")  # Attempt to use WebKit2 4.1
-except ValueError:
-    gi.require_version("WebKit2", "4.0")  # Fallback to WebKit2 4.0
-from gi.repository import Gtk, WebKit2, GdkPixbuf, Gdk
+gi.require_version("Gtk", "4.0")
+gi.require_version("WebKit", "6.0")  # Use WebKitGTK 6.0
+from gi.repository import Gtk, WebKit, GdkPixbuf, Gdk
 
 try:
     from gi.repository import Unity
@@ -26,6 +23,7 @@ except ImportError:
 class TyphoonWindow(Gtk.Window):
     def __init__(self):
         Gtk.Window.__init__(self, title="Typhoon")
+        self.main_loop = GLib.MainLoop()  # Initialize the main loop
         self.aspect_ratio = 3 / 5  # Desired aspect ratio (width / height)
         self._initialize_window()
         self._setup_webview()
@@ -34,7 +32,7 @@ class TyphoonWindow(Gtk.Window):
         self.drag_enabled = True  # Enable dragging by default
 
         # Connect the destroy signal to stop the D-Bus service
-        self.connect("destroy", self._on_destroy)
+        self.connect("close-request", self._on_destroy)
 
         # Retrieve the last remembered size and position from a configuration file
         last_width, last_height = self._get_last_window_size()
@@ -43,13 +41,13 @@ class TyphoonWindow(Gtk.Window):
         self.set_default_size(last_width, last_height)
         if last_position:
             last_x, last_y = last_position
-            self.move(last_x, last_y)
+            # self.move(last_x, last_y)  # Not available in GTK 4, so just skip or comment out
         else:
-            self.set_position(Gtk.WindowPosition.CENTER)  # Default to center of the screen
+            self.set_default_widget(None)  # Default to center of the screen
 
         # Connect to the configure-event signal to maintain aspect ratio and save position
-        self.connect("configure-event", self._maintain_aspect_ratio)
-        self.connect("configure-event", self._save_window_position)
+        self.connect("notify::default-width", self._maintain_aspect_ratio)
+        self.connect("notify::default-height", self._save_window_position)
 
         # Enable resizing by setting the window as resizable
         self.set_resizable(True)
@@ -61,10 +59,11 @@ class TyphoonWindow(Gtk.Window):
         self.add_resize_grip()
 
     def _on_destroy(self, widget):
-        """Stops the D-Bus service when the application is closed."""
+        """Stops the D-Bus service and quits the main loop when the application is closed."""
         if hasattr(self, "launcher_service") and self.launcher_service:
             print("Stopping D-Bus service...")
             self.launcher_service.stop()
+        self.main_loop.quit()  # Quit the main loop
 
     def _maintain_aspect_ratio(self, widget, event):
         """Adjusts the window size to maintain the aspect ratio."""
@@ -81,42 +80,43 @@ class TyphoonWindow(Gtk.Window):
     def _initialize_window(self):
         """Initializes the main window properties."""
         self.set_decorated(False)  # Hide the title bar
-        self.connect("destroy", Gtk.main_quit)
+        self.connect("close-request", self._on_destroy)        
         self._set_window_icon()
 
-        # Use an overlay to combine the WebView and the resize grip
-        self.overlay = Gtk.Overlay()
-        self.add(self.overlay)
+        # Use a Gtk.Box to combine the WebView and the resize grip
+        self.overlay = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.set_child(self.overlay)
 
     def _set_window_icon(self):
         """Sets the window icon if available."""
-        icon_theme = Gtk.IconTheme.get_default()
+        icon_theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
         try:
-            icon = icon_theme.load_icon("typhoon", 48, 0)  # Load icon of size 48
+            icon_info = icon_theme.lookup_icon(
+                "typhoon",           # icon_name
+                None,                # fallbacks
+                48,                  # size
+                1,                   # scale
+                Gtk.TextDirection.NONE,  # direction
+                0                   # flags (no flags)
+            )
+            # GTK 4: Gtk.Window does not have set_icon(), so do nothing here.
+            # If you use Gtk.Application, set the icon there with set_icon_name("typhoon")
         except GLib.Error:
-            icon = None  # If loading the icon fails, set it to None
-        if icon:
-            self.set_icon(icon)
+            print("Failed to load icon.")
 
     def add_resize_grip(self):
         """Adds a resize grip to the bottom-right corner of the window."""
-        grip = Gtk.EventBox()
-        grip.set_visible_window(False)
-
-        # Create a label and apply a CSS class to it
-        label = Gtk.Label(label="⇲")  # Use the keyword argument "label" to avoid the deprecation warning
-        label.get_style_context().add_class("resize-grip")
-        grip.add(label)
-
-        grip.connect("button-press-event", self._start_resize)
-        grip.connect("motion-notify-event", self._resize_window)
-        grip.connect("button-release-event", self._end_resize)
-
-        # Position the grip in the bottom-right corner using the overlay
-        self.overlay.add_overlay(grip)
-        grip.set_halign(Gtk.Align.END)
-        grip.set_valign(Gtk.Align.END)
-
+        label = Gtk.Label(label="⇲")
+        label.add_css_class("resize-grip")
+        grip = Gtk.GestureDrag()
+        label.add_controller(grip)
+        grip.connect("drag-begin", self._start_resize)
+        grip.connect("drag-update", self._resize_window)
+        grip.connect("drag-end", self._end_resize)
+        label.set_halign(Gtk.Align.END)
+        label.set_valign(Gtk.Align.END)
+        # Do NOT set hexpand or vexpand on the label!
+        self.overlay.append(label)
         # Apply CSS to make the label white
         css_provider = Gtk.CssProvider()
         css_provider.load_from_data(b"""
@@ -124,8 +124,8 @@ class TyphoonWindow(Gtk.Window):
                 color: white;
             }
         """)
-        Gtk.StyleContext.add_provider_for_screen(
-            Gdk.Screen.get_default(),
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
             css_provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
@@ -150,8 +150,8 @@ class TyphoonWindow(Gtk.Window):
         self._resizing = False
 
     def _setup_webview(self):
-        """Sets up the WebKit2 WebView and connects signals."""
-        self.webview = WebKit2.WebView()
+        """Sets up the WebKit WebView and connects signals."""
+        self.webview = WebKit.WebView()
 
         # Enable Web Inspector
         # settings = self.webview.get_settings()
@@ -159,7 +159,7 @@ class TyphoonWindow(Gtk.Window):
 
         self.webview.connect("decide-policy", self._handle_policy_decision)
         self.webview.connect("notify::title", self._handle_title_change)
-        self.webview.connect("button-press-event", self._handle_mouse_press)
+        # self.webview.connect("button-press-event", self._handle_mouse_press)  # REMOVE or COMMENT OUT this line
 
         # Load the local HTML file
         html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "typhoon.html")
@@ -170,7 +170,7 @@ class TyphoonWindow(Gtk.Window):
 
     def _on_load_changed(self, webview, load_event):
         """Handles the load-changed event for the WebView."""
-        if load_event == WebKit2.LoadEvent.FINISHED:
+        if load_event == WebKit.LoadEvent.FINISHED:
             # Try to get the dominant color from the wallpaper
             try:
                 # Get the wallpaper path
@@ -237,13 +237,15 @@ class TyphoonWindow(Gtk.Window):
     def send_message_to_webview(self, message):
         """Sends a message to the WebView."""
         js_code = f"receiveMessage({message});"  # Call the JavaScript function with the message
-        self.webview.run_javascript(js_code, None, None, None)
+        self.webview.evaluate_javascript(js_code, -1, None, None, None)
 
     def _setup_scrolled_window(self):
         """Wraps the WebView in a scrolled window and adds it to the overlay."""
         scrolled_window = Gtk.ScrolledWindow()
-        scrolled_window.add(self.webview)
-        self.overlay.add(scrolled_window)
+        scrolled_window.set_child(self.webview)  # Updated for GTK 4
+        scrolled_window.set_hexpand(True)
+        scrolled_window.set_vexpand(True)
+        self.overlay.append(scrolled_window)
 
     def _setup_unity_launcher(self):
         """Configures Unity launcher integration if available."""
@@ -260,24 +262,11 @@ class TyphoonWindow(Gtk.Window):
             self.launcher_thread.start()
 
     def _set_size_constraints(self):
-        """Sets the minimum and maximum size constraints for the window."""
-        display = Gdk.Display.get_default()
-        monitor = display.get_monitor(0)  # Get the primary monitor
-        monitor_geometry = monitor.get_geometry()
-        screen_height = monitor_geometry.height  # Get the height of the screen
-
-        # Set minimum size to 300x500 and maximum height to the screen height
-        geometry = Gdk.Geometry()
-        geometry.min_width = 210
-        geometry.min_height = 350
-        geometry.max_width = int(screen_height*0.9*3/5)
-        geometry.max_height = int(screen_height*0.9)
-
-        self.set_geometry_hints(
-            None,  # No specific widget
-            geometry,
-            Gdk.WindowHints.MIN_SIZE | Gdk.WindowHints.MAX_SIZE,  # Use MAX_SIZE for maximum constraints
-        )
+        """Sets the minimum size constraints for the window (GTK 4)."""
+        # Set minimum size to 210x350
+        self.set_size_request(210, 350)
+        # There is no direct way to set maximum size in GTK 4.
+        # You may want to handle maximum size manually in resize events if needed.
 
     def _get_last_window_size(self):
         """Retrieves the last remembered window size from a configuration file."""
@@ -318,7 +307,7 @@ class TyphoonWindow(Gtk.Window):
 
     def _handle_policy_decision(self, webview, decision, decision_type):
         """Handles navigation policy decisions for the WebView."""
-        if decision_type == WebKit2.PolicyDecisionType.NAVIGATION_ACTION:
+        if decision_type == WebKit.PolicyDecisionType.NAVIGATION_ACTION:
             navigation_action = decision.get_navigation_action()
             uri = navigation_action.get_request().get_uri()
             print(f"Navigation request URI: {uri}")  # Debugging: Print the URI
@@ -350,7 +339,7 @@ class TyphoonWindow(Gtk.Window):
                 print("Invalid height value in title.")
         elif title == "close":
             self._toggle_unity_launcher("disable_launcher")
-            Gtk.main_quit()
+            self._on_destroy()
         elif title == "minimize":
             self.iconify()
         elif title == "disabledrag":
@@ -371,8 +360,7 @@ class TyphoonWindow(Gtk.Window):
         """Sets the window opacity based on the title."""
         try:
             opacity = float(title[1:])
-            if self.get_window():  # Ensure the window is realized
-                self.get_window().set_opacity(opacity)
+            self.set_opacity(opacity)
         except ValueError:
             pass
 
@@ -476,6 +464,6 @@ class Service(dbus.service.Object):
 
 if __name__ == "__main__":
     app = TyphoonWindow()
-    app.show_all()
-    Gtk.main()
+    app.present()  # Ensure the window is shown and focused in GTK 4
+    app.main_loop.run()
 
